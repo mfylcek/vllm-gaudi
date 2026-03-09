@@ -19,6 +19,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.mamba.mamba_mixer2 import (
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
+    LoaderFunction,
     composed_weight_loader,
     sharded_weight_loader,
 )
@@ -41,6 +43,44 @@ from vllm_gaudi.ops.causal_conv1d_pytorch import (
 )
 from vllm_gaudi.ops.ssd_combined import hpu_mamba_chunk_scan_combined_varlen
 from vllm_gaudi.ops.ops_selector import get_selective_state_update_impl
+
+
+def mamba_v2_sharded_weight_loader(
+    shard_spec: list[tuple[int, int, float]],
+    tp_size: int,
+    tp_rank: int,
+) -> LoaderFunction:
+    """Create a weight loader for mamba v2. This ensures that the projections
+    are correctly sharded so that they can be split into x, B, C. It also
+    ensures that all the groups corresponding to a head shard is placed
+    together with it.
+    """
+
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        boundary, loaded_boundary = 0, 0
+
+        for full_dim, extra, duplicate_groups in shard_spec:
+            shard_size = full_dim // tp_size
+
+            rank = 0 if duplicate_groups else tp_rank
+
+            loaded_skip = rank * shard_size
+            loaded_start_idx = loaded_boundary + loaded_skip
+
+            take = min(shard_size, full_dim - extra - loaded_skip)
+
+            param.data[
+                boundary : (boundary + take), ...
+            ] = loaded_weight[
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )
+            ]
+
+            boundary += shard_size
+            loaded_boundary += full_dim - extra
+
+    return loader
 
 
 # Adapted from vllm.model_executor.layers.mamba.mamba_mixer2.Mixer2RMSNormGated
@@ -151,14 +191,13 @@ class HPUMambaMixer2(MambaMixer2):
         super(MambaMixer2, self).__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
 
         assert num_heads % self.tp_size == 0, ("Tensor parallel world size must divide num heads.")
 
         assert (n_groups %
                 self.tp_size) == 0 or n_groups == 1, ("If tensor parallel world size does not divide num_groups, "
                                                       "then num_groups must equal 1.")
-
-        assert n_groups % self.tp_size == 0
 
         self.ssm_state_size = ssm_state_size
         self.conv_kernel_size = conv_kernel_size
@@ -167,36 +206,96 @@ class HPUMambaMixer2(MambaMixer2):
         self.intermediate_size = intermediate_size
         self.head_dim = head_dim
         self.num_heads = num_heads
+
         self.n_groups = n_groups
+        if n_groups % self.tp_size != 0:
+            # Expand n_groups so it is divisible by tp_size.
+            # For n_groups == 1 this becomes tp_size (duplicate the single group).
+            extra_groups = self.tp_size - n_groups
+            self.n_groups = n_groups + extra_groups
 
         self.groups_ssm_state_size = self.n_groups * self.ssm_state_size
         self.conv_dim = intermediate_size + 2 * self.groups_ssm_state_size
 
-        self.conv1d = MergedColumnParallelLinear(
+        # Use ColumnParallelLinear with custom weight loaders for both cases:
+        # - When n_groups % tp_size == 0: standard sharding without duplication
+        # - When n_groups == 1: groups are duplicated across TP ranks
+        self.conv1d = ColumnParallelLinear(
             input_size=conv_kernel_size,
-            output_sizes=[
-                intermediate_size,
-                self.groups_ssm_state_size,
-                self.groups_ssm_state_size,
-            ],
+            output_size=self.conv_dim,
             bias=use_conv_bias,
             quant_config=None,
             prefix=f"{prefix}.conv1d",
         )
 
-        self.in_proj = MergedColumnParallelLinear(
+        self.in_proj = ColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[
-                intermediate_size,
-                intermediate_size,
-                self.groups_ssm_state_size,
-                self.groups_ssm_state_size,
-                self.num_heads,
-            ],
+            output_size=intermediate_size + self.conv_dim + self.num_heads,
             bias=use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
         )
+
+        # Configure shard settings for the custom weight loader:
+        # - group_shard_settings handles group duplication when n_groups == 1
+        # - When n_groups % tp_size == 0, extra=0 and duplicate_groups=False
+        group_shard_settings = (
+            self.groups_ssm_state_size,  # expected model size
+            (self.n_groups - n_groups) * self.ssm_state_size,  # extra dims assigned
+            n_groups == 1,  # duplicate groups when n_groups == 1
+        )
+        intermediate_settings = (intermediate_size, 0, False)
+        head_settings = (self.num_heads, 0, False)
+
+        # Apply custom weight loaders for conv1d (bias and weight)
+        delattr(self.conv1d.bias, "weight_loader")
+        set_weight_attrs(
+            self.conv1d.bias,
+            {
+                "weight_loader": mamba_v2_sharded_weight_loader(
+                    [
+                        intermediate_settings,
+                        group_shard_settings,
+                        group_shard_settings,
+                    ],
+                    self.tp_size,
+                    tp_rank,
+                )
+            },
+        )
+
+        delattr(self.conv1d.weight, "weight_loader")
+        set_weight_attrs(
+            self.conv1d.weight,
+            {
+                "weight_loader": mamba_v2_sharded_weight_loader(
+                    [
+                        intermediate_settings,
+                        group_shard_settings,
+                        group_shard_settings,
+                    ],
+                    self.tp_size,
+                    tp_rank,
+                )
+            },
+        )
+
+        # Create the custom weight loader for in_proj
+        mamba_loader = mamba_v2_sharded_weight_loader(
+            [
+                intermediate_settings,  # for gate
+                intermediate_settings,
+                group_shard_settings,
+                group_shard_settings,
+                head_settings,  # for dt
+            ],
+            self.tp_size,
+            tp_rank,
+        )
+
+        # Apply the custom weight loader to in_proj.weight
+        delattr(self.in_proj.weight, "weight_loader")
+        set_weight_attrs(self.in_proj.weight, {"weight_loader": mamba_loader})
 
         # unsqueeze to fit conv1d weights shape into the linear weights shape.
         # Can't do this in `weight_loader` since it already exists in
