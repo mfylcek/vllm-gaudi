@@ -153,11 +153,18 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.weight_scale = torch.nn.Parameter(ws_channelwise, requires_grad=False)
         elif layer.scheme.strategy == QuantizationStrategy.BLOCK:
             layer = hpu_ops.fp8_block_linear_postprocess_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+            if not envs.VLLM_HPU_FORCE_CHANNEL_FP8:
+                # Block path: don't transpose weight - block dequant expects (out, in) format.
+                # Mark as block-processed so apply_weights can choose the right codepath.
+                layer._block_fp8_processed = True
         else:
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = torch.nn.Parameter(layer.weight_scale.data, requires_grad=False)
 
-        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
+        # Transpose weight for all paths EXCEPT block FP8 without force_channel
+        # (block dequant expects untransposed weight in (out_features, in_features) format)
+        if not getattr(layer, '_block_fp8_processed', False):
+            layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
 
         # see the reference: https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a8_fp8.py#L169-L173
         if layer.scheme.is_static_input_scheme and hasattr(layer, "input_scale"):
@@ -247,6 +254,19 @@ class HPUCompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             layer.register_parameter("input_scale", input_scale)
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None):
+        if getattr(layer, '_block_fp8_processed', False):
+            # Block FP8 path: use block dequant
+            block_size = layer.weight_block_size
+            return hpu_ops.apply_block_fp8_linear_hpu_dequant(
+                input=x,
+                weight=layer.weight,
+                block_size=block_size,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+                original_M=layer.orig_M,
+                original_N=layer.orig_N,
+                do_unpad=True,
+            )
         weight_scale = layer.weight_scale.transpose(0, 1) if layer.weight_scale.dim() > 1 else layer.weight_scale
         input_scale = getattr(layer, 'input_scale', None)
         return hpu_ops.apply_fp8_linear_hpu(input=x,

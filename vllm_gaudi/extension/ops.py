@@ -844,15 +844,13 @@ def apply_block_fp8_linear_hpu_dequant(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    original_M: Optional[torch.Tensor] = None,
-    original_N: Optional[torch.Tensor] = None,
+    original_M: Optional[int] = None,
+    original_N: Optional[int] = None,
     do_unpad: bool = False,
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
-    original_M = original_M.data.item()
-    original_N = original_N.data.item()
     weight = dequant_block_fp8_weight_naive(weight, weight_scale, block_size, input.dtype, original_M, original_N,
                                             do_unpad)
     output = torch.nn.functional.linear(input_2d, weight, bias=None)
@@ -945,20 +943,34 @@ def fp8_perchannel_linear_postprocess_weights(layer):
 
 
 def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
-    weight, orig_M, orig_N = pad_block_fp8_weight_naive(layer.weight.data, layer.weight_scale_inv.data,
-                                                        layer.quant_config.weight_block_size)
+    # Handle both attribute naming conventions:
+    # - Fp8Config path registers scale as 'weight_scale_inv'
+    # - CompressedTensorsW8A8Fp8 path registers scale as 'weight_scale'
+    if hasattr(layer, 'weight_scale_inv'):
+        scale_data = layer.weight_scale_inv.data
+    else:
+        scale_data = layer.weight_scale.data
+    # Block size location differs between quantization paths
+    if hasattr(layer, 'quant_config') and hasattr(layer.quant_config, 'weight_block_size'):
+        block_size = layer.quant_config.weight_block_size
+    else:
+        block_size = layer.weight_block_size
+    weight, orig_M, orig_N = pad_block_fp8_weight_naive(layer.weight.data, scale_data, block_size)
     if force_channel_fp8:
         # convert to channel-wise fp8
         weight, weight_scale_inv = dynamic_quant(
             dequant_block_fp8_weight_naive(weight,
-                                           layer.weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size,
+                                           scale_data,
+                                           block_size,
                                            original_M=orig_M,
                                            original_N=orig_N,
                                            do_unpad=True))
         weight_scale_inv = weight_scale_inv.squeeze(-1)
         layer.weight.data.copy_(weight)
-        layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
+        if hasattr(layer, 'weight_scale_inv'):
+            layer.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
+        else:
+            layer.weight_scale = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
         htorch.core.mark_step()
         return layer
     else:
@@ -966,39 +978,61 @@ def fp8_block_linear_postprocess_weights(layer, force_channel_fp8=False):
         layer.get_dequant_weights_func = types.MethodType(get_dequant_weights_func, layer)
 
     layer.weight = torch.nn.Parameter(weight, requires_grad=False)
-    orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32, device=weight.device), requires_grad=False)
-    orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32, device=weight.device), requires_grad=False)
-    layer.register_parameter("orig_M", orig_M)
-    layer.register_parameter("orig_N", orig_N)
+    # Store as plain Python ints so torch.compile can treat them as constants
+    # without introducing .item() graph breaks.
+    layer.orig_M = int(orig_M)
+    layer.orig_N = int(orig_N)
     htorch.core.mark_step()
     return layer
 
 
 def fp8_block_moe_prepare_weights(layer, force_channel_fp8=False):
+    # Handle both attribute naming conventions:
+    # - Fp8Config path uses 'w13_weight_scale_inv' / 'w2_weight_scale_inv'
+    # - CompressedTensors path uses 'w13_weight_scale' / 'w2_weight_scale'
+    if hasattr(layer, 'w13_weight_scale_inv'):
+        w13_scale_data = layer.w13_weight_scale_inv.data
+        w2_scale_data = layer.w2_weight_scale_inv.data
+    else:
+        w13_scale_data = layer.w13_weight_scale.data
+        w2_scale_data = layer.w2_weight_scale.data
+    # Block size location differs between quantization paths
+    if hasattr(layer, 'quant_config') and hasattr(layer.quant_config, 'weight_block_size'):
+        block_size = layer.quant_config.weight_block_size
+    else:
+        block_size = layer.weight_block_size
     if force_channel_fp8:
         # convert to channel-wise fp8
         w13_weight, w13_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w13_weight.data, layer.w13_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+            dequant_block_fp8_weight_naive(layer.w13_weight.data, w13_scale_data, block_size))
         w2_weight, w2_weight_scale_inv = dynamic_quant(
-            dequant_block_fp8_weight_naive(layer.w2_weight.data, layer.w2_weight_scale_inv.data,
-                                           layer.quant_config.weight_block_size))
+            dequant_block_fp8_weight_naive(layer.w2_weight.data, w2_scale_data, block_size))
         w13_weight_scale_inv, w2_weight_scale_inv \
             = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
         layer.w13_weight.data.copy_(w13_weight)
         layer.w2_weight.data.copy_(w2_weight)
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_weight_scale_inv, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_weight_scale_inv, requires_grad=False)
+        if hasattr(layer, 'w13_weight_scale_inv'):
+            layer.w13_weight_scale_inv = torch.nn.Parameter(w13_weight_scale_inv, requires_grad=False)
+            layer.w2_weight_scale_inv = torch.nn.Parameter(w2_weight_scale_inv, requires_grad=False)
+        else:
+            layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale_inv, requires_grad=False)
+            layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale_inv, requires_grad=False)
         return fp8_channel_moe_prepare_weights(layer)
 
     for index in range(layer.moe_op.num_experts):
         layer.moe_op.w13_list[index].set_weight(layer.w13_weight[index])
-        layer.moe_op.w13_list[index].set_scale_inv_fp8(layer.w13_weight_scale_inv[index])
-        layer.moe_op.w13_list[index].set_weight_block_size(layer.quant_config.weight_block_size)
+        if hasattr(layer, 'w13_weight_scale_inv'):
+            layer.moe_op.w13_list[index].set_scale_inv_fp8(layer.w13_weight_scale_inv[index])
+        else:
+            layer.moe_op.w13_list[index].set_scale_inv_fp8(layer.w13_weight_scale[index])
+        layer.moe_op.w13_list[index].set_weight_block_size(block_size)
 
         layer.moe_op.w2_list[index].set_weight(layer.w2_weight[index])
-        layer.moe_op.w2_list[index].set_scale_inv_fp8(layer.w2_weight_scale_inv[index])
-        layer.moe_op.w2_list[index].set_weight_block_size(layer.quant_config.weight_block_size)
+        if hasattr(layer, 'w2_weight_scale_inv'):
+            layer.moe_op.w2_list[index].set_scale_inv_fp8(layer.w2_weight_scale_inv[index])
+        else:
+            layer.moe_op.w2_list[index].set_scale_inv_fp8(layer.w2_weight_scale[index])
+        layer.moe_op.w2_list[index].set_weight_block_size(block_size)
     htorch.core.mark_step()
     return layer
 

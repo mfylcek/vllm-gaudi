@@ -878,7 +878,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.head_size,
             self.dtype,
             self.kv_cache_dtype_str,
-            self.block_size,
             use_mla=self.model_config.use_mla,
         )
         self.attn_backend_name = getattr(self.attn_backend, "__name__", None)
@@ -5936,7 +5935,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # if len(kv_cache_config.kv_cache_groups) > 1:
         block_sizes = [kv_cache_group.kv_cache_spec.block_size for kv_cache_group in kv_cache_config.kv_cache_groups]
         if block_sizes != [self.cache_config.block_size]:
-            assert self.cache_config.cpu_offload_gb == 0, (
+            cpu_offload_gb = getattr(self.cache_config, 'cpu_offload_gb', None)
+            if cpu_offload_gb is None:
+                cpu_offload_gb = self.vllm_config.offload_config.uva.cpu_offload_gb
+            assert cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details.")
@@ -6197,7 +6199,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         ]
 
         if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [self.cache_config.block_size]:
-            assert self.cache_config.cpu_offload_gb == 0, (
+            cpu_offload_gb = getattr(self.cache_config, 'cpu_offload_gb', None)
+            if cpu_offload_gb is None:
+                cpu_offload_gb = self.vllm_config.offload_config.uva.cpu_offload_gb
+            assert cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
                 "for more details.")
